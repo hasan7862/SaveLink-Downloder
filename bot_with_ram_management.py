@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Link Extractor বট - RAM ম্যানেজমেন্ট সহ
+Link Extractor বট - Requests + BeautifulSoup (কোনো Playwright নেই)
+সরাসরি কাজ করবে Render এ
 """
 
 import telebot
-import asyncio
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
 import time
 import psutil
 import os
 import gc
+import re
 
 # আপনার Bot Token
 BOT_TOKEN = "8348394510:AAHN41D99X35uVUi-7uAII4IECOzxB-EB3Q"
@@ -21,11 +23,15 @@ bot = telebot.TeleBot(BOT_TOKEN)
 RAM_LIMIT = 500
 RAM_CLEANUP_THRESHOLD = 450
 
+# Headers
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+}
+
 # Progress messages
 progress_messages = [
-    "⏳ ব্রাউজার শুরু করছি...",
-    "🔍 savelinks পেজ খুলছি...",
-    "🔗 হোস্টিং লিঙ্ক খুঁজছি...",
+    "⏳ savelinks পেজ খুলছি...",
+    "🔍 হোস্টিং লিঙ্ক খুঁজছি...",
     "📄 হোস্টিং পেজ লোড করছি...",
     "🖱️ ডাউনলোড লিঙ্ক খুঁজছি...",
     "⏱️ সরাসরি লিঙ্ক বের করছি...",
@@ -42,7 +48,7 @@ def get_memory_usage():
 def cleanup_memory():
     """RAM পরিস্কার করুন"""
     gc.collect()
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 
 def check_and_cleanup_ram():
@@ -62,7 +68,7 @@ def check_and_cleanup_ram():
     return True
 
 
-async def extract_link(url):
+def extract_link(url):
     """সরাসরি ডাউনলোড লিঙ্ক বের করুন"""
     
     if "savelinks.me" not in url:
@@ -70,8 +76,6 @@ async def extract_link(url):
             "success": False,
             "error": "❌ savelinks.me URL দিন"
         }
-    
-    browser = None
     
     try:
         # RAM চেক করুন
@@ -81,88 +85,109 @@ async def extract_link(url):
                 "error": "❌ সার্ভার overload - পরে চেষ্টা করুন"
             }
         
-        # Playwright শুরু করুন
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            
-            # savelinks পেজে যান
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            # হোস্টিং লিঙ্ক খুঁজুন - gdflix কে অগ্রাধিকার দিন
-            links = await page.query_selector_all("a")
-            hosting_url = None
-            
+        # savelinks পেজ থেকে হোস্টিং লিঙ্ক বের করুন
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        
+        response = session.get(url, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # সব লিঙ্ক খুঁজুন
+        hosting_url = None
+        links = soup.find_all('a', href=True)
+        
+        # gdflix কে অগ্রাধিকার দিন
+        for link in links:
+            href = link['href']
+            if 'gdflix' in href:
+                hosting_url = href
+                break
+        
+        # যদি gdflix না পাওয়া যায়, অন্যান্য খুঁজুন
+        if not hosting_url:
             for link in links:
-                href = await link.get_attribute("href")
-                if href and "gdflix" in href:
+                href = link['href']
+                if 'hubcloud' in href or 'filepress' in href:
                     hosting_url = href
                     break
-            
-            if not hosting_url:
-                for link in links:
-                    href = await link.get_attribute("href")
-                    if href and "hubcloud" in href:
-                        hosting_url = href
-                        break
-            
-            if not hosting_url:
-                if browser:
-                    await browser.close()
-                return {
-                    "success": False,
-                    "error": "❌ হোস্টিং লিঙ্ক পাওয়া যায়নি"
-                }
-            
-            # হোস্টিং পেজে যান
-            await page.goto(hosting_url, wait_until="domcontentloaded", timeout=30000)
-            
-            # JavaScript লোড হওয়ার জন্য অপেক্ষা করুন
-            await page.wait_for_timeout(2000)
-            
-            # ডাউনলোড লিঙ্ক খুঁজুন
-            all_links = await page.query_selector_all("a")
-            download_link = None
-            
-            for link in all_links:
-                text = await link.inner_text()
-                href = await link.get_attribute("href")
-                
-                if "INSTANT DL" in text and href and href.startswith("http"):
-                    download_link = href
-                    break
-                
-                if href and ("busycdn" in href or "r2.dev" in href or "pixeldrain" in href):
-                    if href.startswith("http"):
-                        download_link = href
-                        break
-            
-            if browser:
-                await browser.close()
-            
-            # RAM পরিস্কার করুন
-            cleanup_memory()
-            
-            if download_link:
-                return {
-                    "success": True,
-                    "downloadLink": download_link
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "❌ ডাউনলোড লিঙ্ক পাওয়া যায়নি"
-                }
-    
-    except Exception as e:
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
         
+        if not hosting_url:
+            return {
+                "success": False,
+                "error": "❌ হোস্টিং লিঙ্ক পাওয়া যায়নি"
+            }
+        
+        # হোস্টিং পেজ থেকে ডাউনলোড লিঙ্ক বের করুন
+        response = session.get(hosting_url, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # ডাউনলোড লিঙ্ক খুঁজুন
+        download_link = None
+        
+        # সব লিঙ্ক চেক করুন
+        links = soup.find_all('a', href=True)
+        
+        for link in links:
+            text = link.get_text(strip=True)
+            href = link['href']
+            
+            # INSTANT DL লিঙ্ক খুঁজুন
+            if 'INSTANT DL' in text and href.startswith('http'):
+                download_link = href
+                break
+            
+            # অন্যান্য ডাউনলোড লিঙ্ক
+            if href.startswith('http') and any(x in href for x in ['busycdn', 'r2.dev', 'pixeldrain']):
+                download_link = href
+                break
+        
+        # JavaScript এ থাকা লিঙ্ক খুঁজুন
+        if not download_link:
+            # Page source এ regex দিয়ে খুঁজুন
+            page_source = response.text
+            
+            # busycdn লিঙ্ক খুঁজুন
+            match = re.search(r'https://instant\.busycdn\.xyz/[a-f0-9:]+', page_source)
+            if match:
+                download_link = match.group(0)
+            
+            # r2.dev লিঙ্ক খুঁজুন
+            if not download_link:
+                match = re.search(r'https://pub-[a-f0-9]+\.r2\.dev/[^\s"\'<>]+', page_source)
+                if match:
+                    download_link = match.group(0)
+            
+            # pixeldrain লিঙ্ক খুঁজুন
+            if not download_link:
+                match = re.search(r'https://pixeldrain\.dev/u/[a-zA-Z0-9]+', page_source)
+                if match:
+                    download_link = match.group(0)
+        
+        session.close()
         cleanup_memory()
         
+        if download_link:
+            return {
+                "success": True,
+                "downloadLink": download_link
+            }
+        else:
+            return {
+                "success": False,
+                "error": "❌ ডাউনলোড লিঙ্ক পাওয়া যায়নি"
+            }
+    
+    except requests.Timeout:
+        return {
+            "success": False,
+            "error": "❌ Timeout - পরে চেষ্টা করুন"
+        }
+    except Exception as e:
+        cleanup_memory()
         return {
             "success": False,
             "error": f"❌ Error: {str(e)[:50]}"
@@ -226,13 +251,13 @@ def handle_message(message):
                 processing_msg.message_id,
                 parse_mode="HTML"
             )
-            time.sleep(1.5)
+            time.sleep(1.2)
         except:
             pass
     
     # এক্সট্র্যাকশন শুরু করুন
     try:
-        result = asyncio.run(extract_link(text))
+        result = extract_link(text)
         
         if result["success"]:
             response = f"""✅ <b>ডাউনলোড লিঙ্ক পেয়েছি!</b>
@@ -260,7 +285,7 @@ def handle_message(message):
 
 
 if __name__ == "__main__":
-    print("🤖 বট শুরু হয়েছে...")
+    print("🤖 বট শুরু হয়েছি...")
     print(f"📊 RAM Limit: {RAM_LIMIT}MB")
     print(f"⚠️ Cleanup Threshold: {RAM_CLEANUP_THRESHOLD}MB")
     print("Ctrl+C দিয়ে বন্ধ করুন")
